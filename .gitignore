@@ -1,0 +1,36 @@
+# Environment / secrets
+.env
+.env.local
+.env.*.local
+
+# Dependencies
+node_modules/
+sdk/node_modules/
+
+# Build artifacts / caches
+dist/
+build/
+.cxx/
+.cache/
+*.tsbuildinfo
+
+# Logs
+logs/
+*.log
+.service-logs/
+
+# Python (none expected, kept for safety)
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Coverage
+coverage/
