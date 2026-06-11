@@ -1,5 +1,7 @@
 # pc-agent
 
+> **Docs & wiki:** [github.com/jaskier-os/docs/wiki](https://github.com/jaskier-os/docs/wiki)
+
 A PC-side agent that turns natural-language requests into shell commands and runs
 them on the local host. It registers with the orchestrator over WebSocket and
 exposes guarded tools: shell execution (allow/deny listed), file read/write/edit,
