@@ -544,6 +544,19 @@ export class PCAgent extends BaseAgent {
       }
     }
 
+    if (action === 'remote_session_export_transcript') {
+      try {
+        const { workDir, sessionId } = request;
+        if (!workDir || !sessionId) {
+          return { requestId, status: 'error', text: 'Missing workDir or sessionId' };
+        }
+        const transcript = await this.remoteSessionManager.exportTranscript(workDir, sessionId);
+        return { requestId, status: 'success', data: { transcript } };
+      } catch (err) {
+        return { requestId, status: 'error', text: err.message };
+      }
+    }
+
     if (action === 'telegram_read_messages') {
       try {
         if (!this.telegram.isReady()) {

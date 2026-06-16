@@ -316,6 +316,29 @@ export class RemoteSessionManager {
     }
   }
 
+  // Reconstruct a session's full transcript from its on-disk JSONL by shelling
+  // out to the remote-session CLI's export-transcript subcommand. Used so the
+  // orchestrator can serve history for conversations started directly on the PC
+  // (which have no server-side transcript). Returns an array of phone RC
+  // transcript entries ({ ts, type, data }).
+  async exportTranscript(workDir, sessionId) {
+    if (!workDir) throw new Error('Missing workDir');
+    if (!sessionId) throw new Error('Missing sessionId');
+    const sessionPath = findSessionBinary(this.sessionBin);
+    const args = ['export-transcript', '--session-id', sessionId, '--dir', workDir, '--json'];
+    const { stdout } = await execFileAsync(sessionPath, args, {
+      maxBuffer: 256 * 1024 * 1024,
+      timeout: 60000,
+    });
+    const trimmed = stdout.trim();
+    if (!trimmed) return [];
+    try {
+      return JSON.parse(trimmed);
+    } catch (err) {
+      throw new Error(`Failed to parse export-transcript output: ${err.message}`);
+    }
+  }
+
   setPermissionMode(sessionId, mode) {
     if (!CLI_MODES.includes(mode)) {
       console.warn(`[remote-sessions] Dropping set_permission_mode with unknown CLI mode: ${mode}`);
