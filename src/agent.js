@@ -531,6 +531,19 @@ export class PCAgent extends BaseAgent {
       return { requestId, status: 'success', data: { sessions } };
     }
 
+    if (action === 'remote_session_list_conversations') {
+      try {
+        const { workDir, limit, offset } = request;
+        if (!workDir) {
+          return { requestId, status: 'error', text: 'Missing workDir' };
+        }
+        const sessions = await this.remoteSessionManager.listConversations(workDir, limit, offset);
+        return { requestId, status: 'success', data: { sessions } };
+      } catch (err) {
+        return { requestId, status: 'error', text: err.message };
+      }
+    }
+
     if (action === 'telegram_read_messages') {
       try {
         if (!this.telegram.isReady()) {

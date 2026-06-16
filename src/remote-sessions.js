@@ -4,6 +4,10 @@ import path from 'node:path';
 import os from 'node:os';
 import { access } from 'fs/promises';
 import { randomUUID } from 'crypto';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+
+const execFileAsync = promisify(execFile);
 
 // Returns true iff Claude Code already has a transcript on disk for this
 // sessionId+workDir pair. Used to switch the spawn args from "fresh session"
@@ -287,6 +291,29 @@ export class RemoteSessionManager {
       });
     }
     return result;
+  }
+
+  // Enumerate resumable conversations on disk for a directory by shelling out
+  // to the remote-session CLI's `list-sessions --json` subcommand. The CLI is
+  // the authority on which conversations exist (it owns the ~/.claude/projects
+  // transcript layout), so we reuse it instead of re-implementing the scan.
+  async listConversations(workDir, limit, offset) {
+    if (!workDir) throw new Error('Missing workDir');
+    const sessionPath = findSessionBinary(this.sessionBin);
+    const args = ['list-sessions', '--dir', workDir, '--json'];
+    if (limit != null) args.push('--limit', String(limit));
+    if (offset != null) args.push('--offset', String(offset));
+    const { stdout } = await execFileAsync(sessionPath, args, {
+      maxBuffer: 64 * 1024 * 1024,
+      timeout: 60000,
+    });
+    const trimmed = stdout.trim();
+    if (!trimmed) return [];
+    try {
+      return JSON.parse(trimmed);
+    } catch (err) {
+      throw new Error(`Failed to parse list-sessions output: ${err.message}`);
+    }
   }
 
   setPermissionMode(sessionId, mode) {
