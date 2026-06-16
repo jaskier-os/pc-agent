@@ -394,7 +394,7 @@ export class PCAgent extends BaseAgent {
     this.telegram = options.telegram;
     this.codeTaskConfig = options.codeTaskConfig || {};
     this.exploreModel = options.exploreModel || options.model;
-    this.remoteSessionManager = new RemoteSessionManager(options.remoteSessionDirs || [], options.orchestratorUrl, options.claudeBin || '');
+    this.remoteSessionManager = new RemoteSessionManager(options.remoteSessionDirs || [], options.orchestratorUrl, options.remoteSessionBin || '');
 
     this.ptcClient = new PTCClient({
       communicatorUrl: options.communicatorUrl,

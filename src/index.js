@@ -54,7 +54,7 @@ const agent = new PCAgent({
   executor,
   telegram,
   remoteSessionDirs: config.remoteSessionDirs,
-  claudeBin: config.claudeBin,
+  remoteSessionBin: config.remoteSessionBin,
   exploreModel: config.exploreModel,
   codeTaskConfig: {
     claudeCodeExecutable: config.claudeCodeExecutable,

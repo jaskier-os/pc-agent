@@ -28,9 +28,10 @@ const schema = Joi.object({
   // Comma-separated list of directories the agent is allowed to open remote
   // code sessions in. Defaults to the current user's home directory.
   REMOTE_SESSION_DIRS: Joi.string().allow('').default(os.homedir()),
-  // Absolute path to the Claude Code CLI binary used for remote code sessions.
-  // If unset, the agent looks the binary up on PATH (`claude`).
-  CLAUDE_BIN: Joi.string().allow('').default('')
+  // Absolute path to the remote-session CLI binary used for remote code sessions
+  // (jaskier-os/remote-session-cli). If unset, the agent looks it up on PATH as
+  // `remote-session` -- independent of any general `claude` command on the host.
+  REMOTE_SESSION_BIN: Joi.string().allow('').default('')
 }).unknown(true);
 
 const { error, value } = schema.validate(process.env);
@@ -58,5 +59,5 @@ export const config = {
   exploreModel: value.EXPLORE_MODEL || value.MODEL,
   remoteSessionDirs: (value.REMOTE_SESSION_DIRS.trim() ? value.REMOTE_SESSION_DIRS : os.homedir())
     .split(',').map(s => s.trim()).filter(Boolean),
-  claudeBin: value.CLAUDE_BIN
+  remoteSessionBin: value.REMOTE_SESSION_BIN
 };

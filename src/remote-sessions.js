@@ -20,29 +20,36 @@ function hasExistingTranscript(workDir, sessionId) {
 const SPAWN_TIMEOUT_MS = 60000;
 const CLI_MODES = ['default', 'acceptEdits', 'bypassPermissions', 'plan'];
 
-// Resolve the Claude Code CLI binary. Preference order:
-//   1. explicit path supplied via the CLAUDE_BIN env var / constructor option
-//   2. `claude` looked up on the system PATH
-// Returns null if neither is available so the caller can surface a clear error.
-function findClaudeBinary(claudeBin) {
-  if (claudeBin && fs.existsSync(claudeBin)) return claudeBin;
-  if (claudeBin) {
-    throw new Error(`Claude Code binary not found at CLAUDE_BIN=${claudeBin}`);
+// Resolve the remote-session CLI binary. This is the standalone `remote-session`
+// app (jaskier-os/remote-session-cli), kept independent of any general-purpose
+// `claude` command the host may also have installed. Resolution order:
+//   1. explicit absolute path (constructor arg or REMOTE_SESSION_BIN)
+//   2. the sibling remote-session-cli checkout (this monorepo's default layout)
+//   3. `remote-session` looked up on the system PATH
+// Returns the path or throws a clear error.
+function findSessionBinary(sessionBin) {
+  if (sessionBin && fs.existsSync(sessionBin)) return sessionBin;
+  if (sessionBin) {
+    throw new Error(`remote-session binary not found at REMOTE_SESSION_BIN=${sessionBin}`);
   }
-  // Fall back to PATH lookup.
+  // Default: the sibling remote-session-cli checkout in the AI/ monorepo
+  // (this agent lives at AI/agents/pc/pc-agent -> ../../../remote-session-cli).
+  const sibling = path.resolve(import.meta.dirname, '../../../../remote-session-cli/bin/remote-session');
+  if (fs.existsSync(sibling)) return sibling;
+  // Fall back to PATH lookup for the dedicated command (NOT `claude`).
   for (const dir of (process.env.PATH || '').split(path.delimiter)) {
     if (!dir) continue;
-    const candidate = path.join(dir, 'claude');
+    const candidate = path.join(dir, 'remote-session');
     try { if (fs.existsSync(candidate)) return candidate; } catch { /* ignore */ }
   }
-  throw new Error('Claude Code binary not found. Set CLAUDE_BIN to its absolute path or install `claude` on PATH.');
+  throw new Error('remote-session binary not found. Set REMOTE_SESSION_BIN to its absolute path or install `remote-session` on PATH (see jaskier-os/remote-session-cli).');
 }
 
 export class RemoteSessionManager {
-  constructor(dirs, orchestratorUrl, claudeBin = '') {
+  constructor(dirs, orchestratorUrl, sessionBin = '') {
     this.dirs = dirs;
     this.orchestratorUrl = orchestratorUrl;
-    this.claudeBin = claudeBin || process.env.CLAUDE_BIN || '';
+    this.sessionBin = sessionBin || process.env.REMOTE_SESSION_BIN || '';
     this.sessions = new Map(); // pid -> { workDir, sessionId, startedAt, process, alive }
     this.startReaper();
   }
@@ -125,7 +132,7 @@ export class RemoteSessionManager {
         console.error(`[remote-sessions] Failed to update NO_PROXY: ${e.message}`);
       }
 
-      // Ensure ~/.local/bin is in PATH (for claude binary)
+      // Ensure ~/.local/bin is in PATH (for the remote-session binary)
       const home = process.env.HOME || '';
       if (home && env.PATH) {
         const extraDirs = [`${home}/.local/bin`, `${home}/.bun/bin`];
@@ -135,7 +142,7 @@ export class RemoteSessionManager {
         }
       }
 
-      const claudePath = findClaudeBinary(this.claudeBin);
+      const sessionPath = findSessionBinary(this.sessionBin);
       const childSessionId = sessionId || randomUUID();
       const permissionArgs = permissionMode === 'bypassPermissions'
         ? ['--dangerously-skip-permissions']
@@ -158,7 +165,7 @@ export class RemoteSessionManager {
       // down) hang the CLI indefinitely on startup, since MCP init is awaited
       // before the session becomes responsive. Remote sessions get a clean
       // empty MCP set; if a session needs MCPs, configure them explicitly.
-      const child = pty.spawn(claudePath, [
+      const child = pty.spawn(sessionPath, [
         '--print',
         '--model', 'claude-opus-4-6[1m]',
         '--effort', 'max',
@@ -239,7 +246,7 @@ export class RemoteSessionManager {
 
       // Resolve immediately -- the WS connection happens asynchronously
       resolved = true;
-      console.log(`[remote-sessions] Session spawned: pid=${pid}, sessionId=${sessionId}, dir=${workDir}, claude=${claudePath}`);
+      console.log(`[remote-sessions] Session spawned: pid=${pid}, sessionId=${sessionId}, dir=${workDir}, bin=${sessionPath}`);
       resolve({ pid, sessionId, workDir, startedAt });
 
       const timeout = setTimeout(() => {
