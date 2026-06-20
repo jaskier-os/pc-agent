@@ -908,6 +908,7 @@ export class PCAgent extends BaseAgent {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${this.apiKey}`
       },
+      signal: AbortSignal.timeout(120_000),
       body: JSON.stringify({
         model: this.model,
         messages,
