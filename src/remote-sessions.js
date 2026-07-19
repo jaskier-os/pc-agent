@@ -4,10 +4,34 @@ import path from 'node:path';
 import os from 'node:os';
 import { access } from 'fs/promises';
 import { randomUUID } from 'crypto';
-import { execFile } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
+
+// ---------------------------------------------------------------------------
+// VS Code recent-projects reader -- shells out to proj-list.py (the same
+// script the terminal `proj` picker uses). Each output line is
+// "<abs_path>\t<label>"; we only need the path column.
+// ---------------------------------------------------------------------------
+const PROJ_LIST_SCRIPT = path.join(os.homedir(), '.local', 'bin', 'proj-list.py');
+
+function getVscodeProjectDirs() {
+  if (!fs.existsSync(PROJ_LIST_SCRIPT)) return [];
+  try {
+    const stdout = execFileSync('python3', [PROJ_LIST_SCRIPT], {
+      encoding: 'utf8',
+      timeout: 5000,
+    });
+    return stdout
+      .split('\n')
+      .filter(Boolean)
+      .map(line => line.split('\t')[0]);
+  } catch (err) {
+    console.error(`[remote-sessions] Failed to read vscode projects: ${err.message}`);
+    return [];
+  }
+}
 
 // Returns true iff Claude Code already has a transcript on disk for this
 // sessionId+workDir pair. Used to switch the spawn args from "fresh session"
@@ -277,6 +301,24 @@ export class RemoteSessionManager {
         }
       });
     });
+  }
+
+  /**
+   * Return the merged directory list: VS Code recent projects first, then
+   * static dirs from the config (deduped). Mirrors the terminal `proj`
+   * picker behaviour.
+   */
+  getDirs() {
+    const vscodeDirs = getVscodeProjectDirs();
+    const seen = new Set(vscodeDirs);
+    const merged = [...vscodeDirs];
+    for (const d of this.dirs) {
+      if (!seen.has(d)) {
+        seen.add(d);
+        merged.push(d);
+      }
+    }
+    return merged;
   }
 
   listSessions() {

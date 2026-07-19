@@ -526,6 +526,11 @@ export class PCAgent extends BaseAgent {
       return { requestId, status: 'success', text: 'permission mode updated' };
     }
 
+    if (action === 'remote_session_dirs') {
+      const dirs = this.remoteSessionManager.getDirs();
+      return { requestId, status: 'success', data: { dirs } };
+    }
+
     if (action === 'remote_session_list') {
       const sessions = this.remoteSessionManager.listSessions();
       return { requestId, status: 'success', data: { sessions } };
