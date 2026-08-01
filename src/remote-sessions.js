@@ -6,6 +6,8 @@ import { access } from 'fs/promises';
 import { randomUUID } from 'crypto';
 import { execFile, execFileSync } from 'node:child_process';
 import { promisify } from 'node:util';
+import { AttachClient } from './attach-client.js';
+import { findLiveSession, waitForLiveSession } from './session-registry.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -37,16 +39,199 @@ function getVscodeProjectDirs() {
 // sessionId+workDir pair. Used to switch the spawn args from "fresh session"
 // (--session-id) to "resume" (--resume) so that respawned CLIs reload the
 // prior conversation context instead of starting blank with the same id.
-function hasExistingTranscript(workDir, sessionId) {
+/**
+ * Mirror of the CLI's sanitizePath (sessionStoragePortable.ts): EVERY
+ * non-alphanumeric character becomes '-'.
+ *
+ * A near-miss here is silent and expensive. Replacing only '/' left dotted
+ * paths (~/.cache/foo) pointing at a directory that does not exist, so an
+ * existing conversation looked brand new, recovery passed --session-id instead
+ * of --resume, and the CLI exited with "Session ID is already in use" --
+ * leaving the phone with no reply at all.
+ *
+ * Paths beyond MAX_SANITIZED_LENGTH get a hash suffix we deliberately do NOT
+ * reimplement: the CLI hashes with Bun.hash under bun and djb2 under node, so
+ * any copy here would be wrong half the time. Those are matched by prefix
+ * instead (see hasExistingTranscript).
+ */
+const MAX_SANITIZED_LENGTH = 200;
+
+export function sanitizeProjectPath(name) {
+  return name.replace(/[^a-zA-Z0-9]/g, '-');
+}
+
+export function hasExistingTranscript(workDir, sessionId) {
   if (!sessionId || !workDir) return false;
-  // Project dir naming: absolute cwd with '/' replaced by '-' (leading dash kept).
-  const projectDir = workDir.replace(/\//g, '-');
-  const jsonl = path.join(os.homedir(), '.claude', 'projects', projectDir, `${sessionId}.jsonl`);
-  try { return fs.statSync(jsonl).size > 0; } catch { return false; }
+  const projectsRoot = path.join(os.homedir(), '.claude', 'projects');
+  const sanitized = sanitizeProjectPath(workDir);
+
+  const direct = path.join(projectsRoot, sanitized, `${sessionId}.jsonl`);
+  try { if (fs.statSync(direct).size > 0) return true; } catch { /* try prefix */ }
+
+  // Over-long paths carry a hash suffix we cannot recompute (see
+  // sanitizeProjectPath), so match on the truncated prefix instead. Guessing
+  // wrong here means --session-id on a live transcript, which kills the CLI.
+  if (sanitized.length <= MAX_SANITIZED_LENGTH) return false;
+  const prefix = sanitized.slice(0, MAX_SANITIZED_LENGTH);
+  let entries;
+  try { entries = fs.readdirSync(projectsRoot); } catch { return false; }
+  for (const entry of entries) {
+    if (!entry.startsWith(prefix)) continue;
+    try {
+      if (fs.statSync(path.join(projectsRoot, entry, `${sessionId}.jsonl`)).size > 0) return true;
+    } catch { /* keep looking */ }
+  }
+  return false;
 }
 
 const SPAWN_TIMEOUT_MS = 60000;
+// How long a freshly spawned interactive CLI gets to publish its attach socket.
+// Measured at ~2.5s on this host; the margin covers a cold bun start and the
+// terminal emulator's own startup.
+const ATTACH_AFTER_SPAWN_TIMEOUT_MS = 60000;
 const CLI_MODES = ['default', 'acceptEdits', 'bypassPermissions', 'plan'];
+
+// Rewrite the wsUrl host to the one this machine actually reaches the
+// orchestrator on. The gateway advertises a public-facing host/port to
+// clients, but pc-agent dials its own configured ORCHESTRATOR_URL.
+//
+// Pure by design so both the spawn and attach paths can call it. Deliberately
+// NOT hoisted above the access(workDir) check in startSession: hoisting would
+// reorder observable behaviour -- today a nonexistent workDir throws before
+// any URL parsing and before the rewrite log line, and this function's
+// swallow-on-error would silently alter spawn argv on a path that used to fail
+// fast.
+// Returns the rewritten URL, or null if it could not be parsed. Callers keep
+// the original URL on null -- same as the inline code this replaced.
+export function rewriteWsUrl(wsUrl, orchestratorUrl) {
+  if (!orchestratorUrl || !wsUrl) return null;
+  try {
+    const orcUrl = new URL(orchestratorUrl.replace('wss://', 'https://').replace('ws://', 'http://'));
+    const sdkUrl = new URL(wsUrl.replace('wss://', 'https://').replace('ws://', 'http://'));
+    sdkUrl.hostname = orcUrl.hostname;
+    sdkUrl.port = orcUrl.port;
+    return sdkUrl.toString().replace('https://', 'wss://').replace('http://', 'ws://');
+  } catch (e) {
+    console.error(`[remote-sessions] Failed to rewrite wsUrl: ${e.message}`);
+    return null;
+  }
+}
+
+/**
+ * Build the argv for an INTERACTIVE remote-session CLI.
+ *
+ * There is exactly one kind of session: a real interactive TUI the user can see
+ * and type into. The phone always works by attaching to one of these. Headless
+ * `--print` is deliberately NOT used -- a `--print` process cannot be attached
+ * to, renders nothing on the PC, and is a different code path from a real turn,
+ * so it can never satisfy "both sides in sync".
+ *
+ * No --model / --effort: the TUI restores the user's last-used model itself.
+ * Pinning one here would silently override the model the user chose.
+ */
+export function buildSpawnArgs(childSessionId, permissionMode, resuming) {
+  const permissionArgs = permissionMode === 'bypassPermissions'
+    ? ['--dangerously-skip-permissions']
+    : ['--permission-mode', permissionMode];
+  const sessionArgs = resuming
+    ? ['--resume', childSessionId]
+    : ['--session-id', childSessionId];
+  return [
+    ...sessionArgs,
+    '--strict-mcp-config',
+    '--mcp-config', '{"mcpServers":{}}',
+    ...permissionArgs,
+  ];
+}
+
+/**
+ * Wrap an interactive CLI invocation in a real terminal window so the PC user
+ * can SEE and drive the session the phone is attached to. A bare pty.spawn is
+ * invisible -- the user reported never seeing any of the sessions it created,
+ * which defeats the point of attaching to "the CLI you already have open".
+ *
+ * Returns [command, args] for pty.spawn. Falls back to running the CLI directly
+ * (invisible, but functional) when no terminal emulator or display is present,
+ * e.g. a headless host.
+ */
+export function buildTerminalCommand(sessionPath, cliArgs, title) {
+  const hasDisplay = Boolean(process.env.DISPLAY || process.env.WAYLAND_DISPLAY);
+  if (!hasDisplay) return [sessionPath, cliArgs];
+
+  for (const term of TERMINAL_EMULATORS) {
+    const bin = findOnPath(term.bin);
+    if (!bin) continue;
+    return [bin, [...term.args(title), sessionPath, ...cliArgs]];
+  }
+  return [sessionPath, cliArgs];
+}
+
+/**
+ * Env additions that make a new session open as a TAB in the terminal window the
+ * user already has open, rather than as a separate window they must dock.
+ *
+ * gnome-terminal's `--tab` only joins an existing window when the caller looks
+ * like a child of that window's shell. BOTH variables are required:
+ *   - GNOME_TERMINAL_SERVICE identifies the server process
+ *   - GNOME_TERMINAL_SCREEN identifies WHICH window to put the tab in
+ * With only the first, --tab silently opens a new window -- verified by counting
+ * toplevel windows before/after. A child of the user's shell inherits both;
+ * pc-agent is a daemon and inherits neither, so it must recover them from a live
+ * process (a shell running inside the user's terminal).
+ *
+ * Returns {} when nothing is found -- the caller then simply gets a new window,
+ * which still works.
+ */
+export function terminalAttachEnv() {
+  try {
+    for (const pid of fs.readdirSync('/proc')) {
+      if (!/^\d+$/.test(pid)) continue;
+      let raw;
+      try {
+        raw = fs.readFileSync(`/proc/${pid}/environ`, 'utf8');
+      } catch {
+        continue; // not ours / gone
+      }
+      const vars = raw.split('\0');
+      const service = vars.find(v => v.startsWith('GNOME_TERMINAL_SERVICE='));
+      const screen = vars.find(v => v.startsWith('GNOME_TERMINAL_SCREEN='));
+      if (service && screen) {
+        return {
+          GNOME_TERMINAL_SERVICE: service.slice('GNOME_TERMINAL_SERVICE='.length),
+          GNOME_TERMINAL_SCREEN: screen.slice('GNOME_TERMINAL_SCREEN='.length),
+        };
+      }
+    }
+  } catch { /* /proc unreadable -- fall through */ }
+  return {};
+}
+
+// Ordered by preference: the terminal the user actually works in comes first,
+// so a session opens somewhere they will notice it. The command-separator flag
+// (`-e` / `--`) must come last in each arg list -- everything after it is the
+// command to run.
+//
+// gnome-terminal needs --wait: without it the launcher hands the window to
+// gnome-terminal-server and exits IMMEDIATELY, so pc-agent's pty would see the
+// session die the instant it started.
+// `--tab` (gnome-terminal) / `--new-tab` (konsole) attach the session to the
+// window the user already has open instead of spawning a second one they would
+// have to dock and manage by hand.
+const TERMINAL_EMULATORS = [
+  { bin: 'gnome-terminal', args: title => ['--tab', '--wait', '--title', title, '--'] },
+  { bin: 'konsole', args: title => ['--new-tab', '-p', `tabtitle=${title}`, '-e'] },
+  { bin: 'kitty', args: title => ['--title', title, '-e'] },
+  { bin: 'xterm', args: title => ['-title', title, '-e'] },
+];
+
+function findOnPath(bin) {
+  for (const dir of (process.env.PATH || '').split(path.delimiter)) {
+    if (!dir) continue;
+    const candidate = path.join(dir, bin);
+    try { if (fs.existsSync(candidate)) return candidate; } catch { /* ignore */ }
+  }
+  return null;
+}
 
 // Resolve the remote-session CLI binary. This is the standalone `remote-session`
 // app (jaskier-os/remote-session-cli), kept independent of any general-purpose
@@ -79,6 +264,12 @@ export class RemoteSessionManager {
     this.orchestratorUrl = orchestratorUrl;
     this.sessionBin = sessionBin || process.env.REMOTE_SESSION_BIN || '';
     this.sessions = new Map(); // pid -> { workDir, sessionId, startedAt, process, alive }
+    // sessionId -> in-flight startSession promise. Inserted SYNCHRONOUSLY, so
+    // concurrent callers share one attempt. The this.sessions dedup below
+    // cannot do this on its own: its entry is only set after `await
+    // access(workDir)` and the spawn, and the attach branch's await widens
+    // that window further. Mirrors the orchestrator's inFlightRespawns.
+    this._starting = new Map();
     this.startReaper();
   }
 
@@ -87,6 +278,27 @@ export class RemoteSessionManager {
       throw new Error('invalid_permission_mode: ' + permissionMode);
     }
 
+    if (!sessionId) {
+      return this._startSessionInner(workDir, sessionId, wsUrl, apiKey, permissionMode);
+    }
+    // Keyed on sessionId AND workDir: sharing across different workDirs would
+    // hand the second caller a result for a directory it never asked for, and
+    // would skip its own access(workDir) validation.
+    const key = `${sessionId}\u0000${workDir}`;
+    const inFlight = this._starting.get(key);
+    if (inFlight) {
+      console.log(`[remote-sessions] Session ${sessionId} start already in flight, sharing result`);
+      return inFlight;
+    }
+    const promise = this._startSessionInner(workDir, sessionId, wsUrl, apiKey, permissionMode)
+      .finally(() => {
+        this._starting.delete(key);
+      });
+    this._starting.set(key, promise);
+    return promise;
+  }
+
+  async _startSessionInner(workDir, sessionId, wsUrl, apiKey, permissionMode) {
     // Dedup: if a CLI for this sessionId is already alive, return it instead
     // of spawning a duplicate. This prevents the race where the phone's retry
     // loop triggers multiple spawns before the first CLI's WS connects.
@@ -94,7 +306,7 @@ export class RemoteSessionManager {
       for (const [pid, s] of this.sessions) {
         if (s.sessionId === sessionId && s.alive) {
           console.log(`[remote-sessions] Session ${sessionId} already alive (pid=${pid}), returning existing`);
-          return { pid, sessionId: s.sessionId, workDir: s.workDir, startedAt: s.startedAt };
+          return { pid, sessionId: s.sessionId, workDir: s.workDir, startedAt: s.startedAt, attached: s.kind === 'attached' };
         }
       }
     }
@@ -106,22 +318,50 @@ export class RemoteSessionManager {
       throw new Error(`Directory does not exist: ${workDir}`);
     }
 
+    // If the user already has an interactive CLI open on exactly this
+    // conversation and directory, hand the phone to that live process instead
+    // of spawning a second headless one for the same transcript. The attached
+    // CLI opens the orchestrator WS itself, so it simply becomes the desktop
+    // and every orchestrator-side state machine sees what it sees today.
+    const live = sessionId ? findLiveSession(sessionId, workDir) : null;
+    if (live) {
+      try {
+        const attached = await this._attachToLiveSession(live, {
+          sessionId,
+          workDir,
+          wsUrl: rewriteWsUrl(wsUrl, this.orchestratorUrl) ?? wsUrl,
+          apiKey,
+          permissionMode,
+        });
+        return attached;
+      } catch (err) {
+        // already_attached means a control peer is ALREADY driving that CLI as
+        // this session's desktop -- the desired end state. Spawning here would
+        // create a second desktop competing for the same sessionId, which is
+        // precisely the flap the one-WS-per-session invariant forbids. Report
+        // success against the live pid instead.
+        if (err.code === 'already_attached') {
+          console.log(`[remote-sessions] Session ${sessionId} already attached to pid=${live.pid}; reporting existing`);
+          return { pid: live.pid, sessionId, workDir, startedAt: new Date().toISOString(), attached: true };
+        }
+        // consent_denied means the PC user explicitly revoked attach for this
+        // session; every other failure is transient. Both fall through to
+        // spawn, which is the correct degradation in either case.
+        console.log(`[remote-sessions] Attach to pid=${live.pid} failed (${err.message}); falling back to spawn`);
+      }
+    }
+
     // Rewrite wsUrl host to match our local orchestrator connection.
     // The gateway may advertise a public-facing host/port to clients, but this
     // machine reaches the orchestrator via its own configured ORCHESTRATOR_URL,
     // so rewrite the host/port of the SDK websocket URL accordingly.
+    // Kept at this call site (not hoisted) so a nonexistent workDir still
+    // throws before any URL parsing and before the rewrite log line.
     if (this.orchestratorUrl && wsUrl) {
-      try {
-        // Parse orchestrator URL (convert to http for URL parsing, preserve ws scheme)
-        const orcUrl = new URL(this.orchestratorUrl.replace('wss://', 'https://').replace('ws://', 'http://'));
-        const sdkUrl = new URL(wsUrl.replace('wss://', 'https://').replace('ws://', 'http://'));
-        sdkUrl.hostname = orcUrl.hostname;
-        sdkUrl.port = orcUrl.port;
-        // Convert back to wss:// for WebSocket transport
-        wsUrl = sdkUrl.toString().replace('https://', 'wss://').replace('http://', 'ws://');
+      const rewritten = rewriteWsUrl(wsUrl, this.orchestratorUrl);
+      if (rewritten) {
+        wsUrl = rewritten;
         console.log(`[remote-sessions] Rewrote sdk-url to: ${wsUrl}`);
-      } catch (e) {
-        console.error(`[remote-sessions] Failed to rewrite wsUrl: ${e.message}`);
       }
     }
 
@@ -135,30 +375,11 @@ export class RemoteSessionManager {
         if (key.startsWith('CLAUDE_CODE_')) delete env[key];
       }
 
-      // Set bridge env vars so claude's RemoteIO connects to our orchestrator WS
-      env.CLAUDE_CODE_SESSION_ACCESS_TOKEN = apiKey;
-      env.CLAUDE_CODE_ENVIRONMENT_KIND = 'bridge';
-      env.NODE_TLS_REJECT_UNAUTHORIZED = '0'; // orchestrator uses self-signed cert
-      delete env.CLAUDE_CODE_OAUTH_TOKEN;
-
-      // Bypass system proxy for the orchestrator WS host. claude inherits
-      // HTTP(S)_PROXY from pc-agent (used to bypass DPI for Anthropic API),
-      // but the SDK WS URL is a LAN address that must connect directly --
-      // routing it through the upstream proxy times out silently and the
-      // session never attaches.
-      try {
-        const sdkHost = new URL(wsUrl.replace('wss://', 'https://').replace('ws://', 'http://')).hostname;
-        const existing = env.NO_PROXY || env.no_proxy || '';
-        const parts = existing.split(',').map(s => s.trim()).filter(Boolean);
-        if (sdkHost && !parts.includes(sdkHost)) {
-          parts.push(sdkHost);
-        }
-        const noProxy = parts.join(',');
-        env.NO_PROXY = noProxy;
-        env.no_proxy = noProxy;
-      } catch (e) {
-        console.error(`[remote-sessions] Failed to update NO_PROXY: ${e.message}`);
-      }
+      // No bridge/RemoteIO env vars and no NODE_TLS_REJECT_UNAUTHORIZED here:
+      // this is a plain interactive TUI, exactly like one the user starts by
+      // hand. It never dials the orchestrator itself -- the attach that follows
+      // hands it the WS URL and a scoped CA pin over the attach socket, so TLS
+      // verification stays on for everything else in that process.
 
       // Ensure ~/.local/bin is in PATH (for the remote-session binary)
       const home = process.env.HOME || '';
@@ -172,9 +393,6 @@ export class RemoteSessionManager {
 
       const sessionPath = findSessionBinary(this.sessionBin);
       const childSessionId = sessionId || randomUUID();
-      const permissionArgs = permissionMode === 'bypassPermissions'
-        ? ['--dangerously-skip-permissions']
-        : ['--permission-mode', permissionMode];
       // If a transcript already exists for this session id + workDir, the
       // CLI process is being respawned (previous PID died -- crash, idle
       // exit, or our orchestrator-driven kill). Use --resume so the new
@@ -182,31 +400,20 @@ export class RemoteSessionManager {
       // would create a fresh session that happens to share the id, and the
       // model would have zero memory of previous turns.
       const resuming = hasExistingTranscript(workDir, childSessionId);
-      const sessionArgs = resuming
-        ? ['--resume', childSessionId]
-        : ['--session-id', childSessionId];
       if (resuming) {
         console.log(`[remote-sessions] Resuming existing session ${childSessionId}`);
       }
-      // Isolate MCP servers: do not inherit user's interactive ~/.claude.json
-      // mcpServers config. Stale entries (e.g. an MCP whose backing service is
-      // down) hang the CLI indefinitely on startup, since MCP init is awaited
-      // before the session becomes responsive. Remote sessions get a clean
-      // empty MCP set; if a session needs MCPs, configure them explicitly.
-      const child = pty.spawn(sessionPath, [
-        '--print',
-        '--model', 'claude-opus-4-6[1m]',
-        '--effort', 'max',
-        '--sdk-url', wsUrl,
-        ...sessionArgs,
-        '--input-format', 'stream-json',
-        '--output-format', 'stream-json',
-        '--verbose',
-        '--strict-mcp-config',
-        '--mcp-config', '{"mcpServers":{}}',
-        ...permissionArgs,
-        '--replay-user-messages',
-      ], {
+      // buildSpawnArgs also isolates MCP servers (--strict-mcp-config with an
+      // empty set): inheriting the user's interactive ~/.claude.json mcpServers
+      // lets a stale entry whose backing service is down hang the CLI forever,
+      // since MCP init is awaited before the session becomes responsive.
+      const cliArgs = buildSpawnArgs(childSessionId, permissionMode, resuming);
+      const [spawnCmd, spawnArgs] = buildTerminalCommand(
+        sessionPath, cliArgs, `remote-session ${childSessionId.slice(0, 8)}`,
+      );
+      // Join the user's existing terminal window as a tab (see terminalAttachEnv).
+      Object.assign(env, terminalAttachEnv());
+      const child = pty.spawn(spawnCmd, spawnArgs, {
         name: 'xterm-256color',
         cols: 120,
         rows: 30,
@@ -272,10 +479,33 @@ export class RemoteSessionManager {
         }
       });
 
-      // Resolve immediately -- the WS connection happens asynchronously
-      resolved = true;
-      console.log(`[remote-sessions] Session spawned: pid=${pid}, sessionId=${sessionId}, dir=${workDir}, bin=${sessionPath}`);
-      resolve({ pid, sessionId, workDir, startedAt });
+      console.log(`[remote-sessions] Session spawned: pid=${pid}, sessionId=${childSessionId}, dir=${workDir}, bin=${sessionPath}`);
+
+      // The CLI we just started is an ordinary interactive TUI -- it does NOT
+      // dial the orchestrator on its own (no --sdk-url). Wait for it to publish
+      // its attach socket, then attach exactly as we would to a session the user
+      // had already opened. One code path serves both cases.
+      //
+      // The pid we attach to is the CLI's, not the terminal wrapper's, so it is
+      // resolved from the session registry by sessionId rather than assumed.
+      waitForLiveSession(childSessionId, workDir, ATTACH_AFTER_SPAWN_TIMEOUT_MS)
+        .then(live => this._attachToLiveSession(live, {
+          sessionId: childSessionId,
+          workDir,
+          wsUrl,
+          apiKey,
+          permissionMode,
+        }))
+        .then(attached => {
+          resolved = true;
+          resolve(attached);
+        })
+        .catch(err => {
+          if (resolved) return;
+          resolved = true;
+          try { child.kill(); } catch { /* already gone */ }
+          reject(new Error(`Spawned CLI never became attachable: ${err.message}`));
+        });
 
       const timeout = setTimeout(() => {
         const session = this.sessions.get(pid);
@@ -304,6 +534,71 @@ export class RemoteSessionManager {
   }
 
   /**
+   * The orchestrator's CA in PEM form, handed to the attached CLI so it can
+   * verify the self-signed certificate on that one socket.
+   *
+   * Deliberately NOT NODE_TLS_REJECT_UNAUTHORIZED=0 (which the spawn path uses
+   * for a throwaway headless process): the attached CLI is the user's own
+   * interactive session, and that variable is process-global -- it would
+   * disable certificate verification for every TLS client in it, Anthropic API
+   * calls included. Read lazily and cached; a missing CA just means no pin.
+   */
+  _getCaPem() {
+    if (this._caPem !== undefined) return this._caPem;
+    const caPath = process.env.NODE_EXTRA_CA_CERTS;
+    if (!caPath) {
+      this._caPem = null;
+      return null;
+    }
+    try {
+      this._caPem = fs.readFileSync(caPath, 'utf8');
+    } catch (err) {
+      console.warn(`[remote-sessions] Could not read CA from NODE_EXTRA_CA_CERTS: ${err.message}`);
+      this._caPem = null;
+    }
+    return this._caPem;
+  }
+
+  /**
+   * Attach to a live interactive CLI. Resolves only once the CLI's own
+   * orchestrator WebSocket is up (the AttachClient gates on attach_ok), so the
+   * map entry below is never recorded for an attach that produced no desktop.
+   */
+  async _attachToLiveSession(live, opts) {
+    const client = await AttachClient.attach(live, {
+      sessionId: opts.sessionId,
+      workDir: opts.workDir,
+      wsUrl: opts.wsUrl,
+      apiKey: opts.apiKey,
+      caPem: this._getCaPem(),
+      permissionMode: opts.permissionMode,
+    });
+
+    const startedAt = new Date().toISOString();
+    this.sessions.set(live.pid, {
+      kind: 'attached',
+      client,
+      workDir: opts.workDir,
+      sessionId: opts.sessionId,
+      startedAt,
+      process: null,
+      alive: true,
+    });
+
+    // Synchronous teardown of the map entry. The 60s reaper is far too slow:
+    // until the entry is gone, every phone message for up to a minute resolves
+    // to a dead session while the orchestrator's respawn guard never clears and
+    // pending messages expire at 60s.
+    client.once('detached', reason => {
+      console.log(`[remote-sessions] Attached session pid=${live.pid} detached: ${reason}`);
+      this.sessions.delete(live.pid);
+    });
+
+    console.log(`[remote-sessions] Attached to live session: pid=${live.pid}, sessionId=${opts.sessionId}, dir=${opts.workDir}`);
+    return { pid: live.pid, sessionId: opts.sessionId, workDir: opts.workDir, startedAt, attached: true };
+  }
+
+  /**
    * Return the merged directory list: VS Code recent projects first, then
    * static dirs from the config (deduped). Mirrors the terminal `proj`
    * picker behaviour.
@@ -329,7 +624,8 @@ export class RemoteSessionManager {
         workDir: session.workDir,
         sessionId: session.sessionId,
         startedAt: session.startedAt,
-        alive: session.alive
+        alive: session.alive,
+        attached: session.kind === 'attached'
       });
     }
     return result;
@@ -388,6 +684,17 @@ export class RemoteSessionManager {
     }
     for (const [pid, session] of this.sessions) {
       if (session.sessionId === sessionId) {
+        // Attached entries are checked FIRST: they have no `process`, so the
+        // spawn-path guard below would silently refuse them.
+        if (session.kind === 'attached') {
+          if (!session.alive || !session.client) {
+            console.warn(`[remote-sessions] Cannot set_permission_mode: attached session ${sessionId} not alive`);
+            return false;
+          }
+          const sent = session.client.setPermissionMode(mode);
+          console.log(`[remote-sessions] Forwarded set_permission_mode mode=${mode} to attached pid=${pid}`);
+          return sent;
+        }
         if (!session.alive || !session.process) {
           console.warn(`[remote-sessions] Cannot set_permission_mode: session ${sessionId} not alive`);
           return false;
@@ -408,6 +715,14 @@ export class RemoteSessionManager {
   async stopSession(pid) {
     const session = this.sessions.get(pid);
     if (!session) return false;
+    // An attached entry is the user's own interactive shell. Detach it --
+    // NEVER kill it.
+    if (session.kind === 'attached') {
+      console.log(`[remote-sessions] Detaching from live session pid=${pid}`);
+      session.client?.detach('session_stopped');
+      this.sessions.delete(pid);
+      return true;
+    }
     if (!session.alive || !session.process) {
       this.sessions.delete(pid);
       return true;
@@ -459,6 +774,10 @@ export class RemoteSessionManager {
           console.log(`[remote-sessions] Reaping orphaned session pid=${pid}`);
           session.alive = false;
           session.process = null;
+          // For an attached entry the pid is the user's interactive CLI: its
+          // death is a detach, so drop the control client without killing
+          // anything.
+          if (session.kind === 'attached') session.client?.destroy();
           this.sessions.delete(pid);
         }
       }

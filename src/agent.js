@@ -506,7 +506,7 @@ export class PCAgent extends BaseAgent {
           return { requestId, status: 'error', text: 'invalid_permission_mode' };
         }
         const session = await this.remoteSessionManager.startSession(workDir, sessionId, wsUrl, apiKey, permissionMode);
-        return { requestId, status: 'success', data: { sessionId: session.sessionId, workDir: session.workDir, pid: session.pid } };
+        return { requestId, status: 'success', data: { sessionId: session.sessionId, workDir: session.workDir, pid: session.pid, attached: session.attached === true } };
       } catch (err) {
         return { requestId, status: 'error', text: err.message };
       }

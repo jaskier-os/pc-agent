@@ -6,8 +6,9 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "node --watch src/index.js",
-    "test": "node tests/unit-tools.test.js",
+    "test": "node tests/unit-tools.test.js && node tests/attach.test.js",
     "test:unit": "node tests/unit-tools.test.js",
+    "test:attach": "node tests/attach.test.js",
     "test:e2e": "node tests/e2e.test.js",
     "test:e2e:enhanced": "node tests/e2e-enhanced-tools.test.js",
     "test:pipeline": "node tests/e2e-pipeline.test.js"
