@@ -4,6 +4,7 @@
  */
 
 import { TelegramClient } from 'telegram';
+import { LogLevel } from 'telegram/extensions/Logger.js';
 import { StringSession } from 'telegram/sessions/index.js';
 import { Api } from 'telegram/tl/index.js';
 import { NewMessage, Raw } from 'telegram/events/index.js';
@@ -21,6 +22,42 @@ let client = null;
 let ready = false;
 let statusMessage = 'Telegram not initialized yet';
 let retryTimer = null;
+let lastNoiseLogAt = 0;
+let suppressedNoise = 0;
+
+const NOISE_LOG_INTERVAL_MS = 60000;
+
+/**
+ * Errors gramjs recovers from on its own by reconnecting. Everything else
+ * (auth revoked, session invalidated, flood wait, DC migration) is terminal or
+ * actionable and must never be throttled away behind a burst of these.
+ */
+const SELF_HEALING_ERRORS = /TIMEOUT|Not connected|Disconnect|connection closed|closed while receiving|Reconnect|ECONNRESET|EPIPE|ETIMEDOUT/i;
+
+/**
+ * gramjs logs a full stack for every ping failure. During network churn (VPN
+ * re-address, ISP DPI dropping long-lived connections) that fires every few
+ * seconds: it produced a 94MB log of which 99.8 percent was library noise.
+ * Self-healing failures are collapsed to one line per minute; anything else is
+ * printed immediately so a genuinely broken client stays visible.
+ * @param {string} message
+ */
+function logLibMessage(message) {
+  if (!SELF_HEALING_ERRORS.test(message)) {
+    console.error(`[telegram] ${message}`);
+    return;
+  }
+  const now = Date.now();
+  if (now - lastNoiseLogAt < NOISE_LOG_INTERVAL_MS) {
+    suppressedNoise++;
+    return;
+  }
+  const since = lastNoiseLogAt ? new Date(lastNoiseLogAt).toISOString() : 'startup';
+  const suffix = suppressedNoise > 0 ? ` (${suppressedNoise} more since ${since})` : '';
+  console.error(`[telegram] ${message}${suffix}`);
+  lastNoiseLogAt = now;
+  suppressedNoise = 0;
+}
 
 function promptInput(question) {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
@@ -70,6 +107,23 @@ export async function initialize({ apiId, apiHash, session, socksProxy }) {
   }
 
   client = new TelegramClient(stringSession, apiId, apiHash, opts);
+  lastNoiseLogAt = 0;
+  suppressedNoise = 0;
+
+  // Two separate emitters have to be handled. gramjs dumps a bare console.error(err)
+  // stack for each ping failure, guarded only by canSend(ERROR), so the level must be
+  // NONE to stop it. But NONE also makes _log() early-return, which would drop the
+  // warn tier (broken auth key, flood wait, internal Telegram issues) -- those never
+  // call _errorHandler. Overriding _log bypasses the level check and keeps them.
+  client.setLogLevel(LogLevel.NONE);
+  client.logger._log = (level, message) => {
+    // The info/debug tiers are pure connect/disconnect/download churn (measured:
+    // 25k lines, no diagnostic value). Warn carries real signal, so keep it.
+    if (level === LogLevel.INFO || level === LogLevel.DEBUG) return;
+    logLibMessage(`${level}: ${message}`);
+  };
+  // Errors additionally reach _errorHandler, which fires before the level check.
+  client.onError = (err) => logLibMessage(`client error: ${err.message}`);
 
   const connectWithTimeout = (timeoutMs = 30000) => {
     return Promise.race([
