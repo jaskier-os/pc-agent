@@ -154,8 +154,112 @@ export function buildSpawnArgs(childSessionId, permissionMode, resuming) {
  * (invisible, but functional) when no terminal emulator or display is present,
  * e.g. a headless host.
  */
+/**
+ * The DISPLAY / WAYLAND_DISPLAY of the user's graphical session.
+ *
+ * pc-agent runs under `systemd --user`, which does NOT inherit DISPLAY from the
+ * graphical session. Reading process.env directly therefore found nothing,
+ * buildTerminalCommand took its headless fallback, and the CLI ran bare inside
+ * pc-agent's own pty: the session worked and the phone attached, but no terminal
+ * tab ever appeared -- the user could not see or type into the session they were
+ * supposedly sharing.
+ *
+ * Recovered from a live process the same way terminalAttachEnv recovers the
+ * gnome-terminal window ids. Returns {} on a genuinely headless host, where
+ * running the CLI directly IS correct.
+ */
+function* scanProcessEnvirons() {
+  let pids;
+  try {
+    pids = fs.readdirSync('/proc');
+  } catch {
+    return; // /proc unreadable
+  }
+  for (const pid of pids) {
+    if (!/^\d+$/.test(pid)) continue;
+    try {
+      yield fs.readFileSync(`/proc/${pid}/environ`, 'utf8').split('\0');
+    } catch {
+      continue; // not ours / gone
+    }
+  }
+}
+
+// An X display is local when its socket exists. Used to reject a forwarded
+// `ssh -X` display (localhost:10.0) in favour of the seat the user is sitting
+// at -- /proc order is arbitrary, so without this the wrong one can win.
+function hasLocalX11Socket(display) {
+  const m = /^:(\d+)(\.\d+)?$/.exec(display);
+  if (!m) return false;
+  return fs.existsSync(`/tmp/.X11-unix/X${m[1]}`);
+}
+
+/**
+ * The DISPLAY / WAYLAND_DISPLAY of the user's graphical session, plus the
+ * variables an emulator needs to actually use it.
+ *
+ * pc-agent runs under `systemd --user`, which does NOT inherit DISPLAY from the
+ * graphical session. Reading process.env directly therefore found nothing,
+ * buildTerminalCommand took its headless fallback, and the CLI ran bare inside
+ * pc-agent's own pty: the session worked and the phone attached, but no terminal
+ * tab ever appeared -- the user could not see or type into the session they were
+ * supposedly sharing.
+ *
+ * Recovered from a live process the same way terminalAttachEnv recovers the
+ * gnome-terminal window ids. Reading another user's environ fails closed (mode
+ * 0400), so this stays within the user's own session as long as pc-agent is not
+ * running as root. Returns {} on a genuinely headless host, where running the
+ * CLI directly IS correct.
+ *
+ * The seams exist so the headless and multi-display branches are testable on
+ * any host; production calls take the defaults.
+ */
+export function resolveDisplayEnv({
+  processEnv = process.env,
+  scanProcesses = scanProcessEnvirons,
+  hasLocalDisplaySocket = hasLocalX11Socket,
+} = {}) {
+  if (processEnv.DISPLAY) {
+    const env = { DISPLAY: processEnv.DISPLAY };
+    if (processEnv.XAUTHORITY) env.XAUTHORITY = processEnv.XAUTHORITY;
+    return env;
+  }
+  if (processEnv.WAYLAND_DISPLAY) {
+    return { WAYLAND_DISPLAY: processEnv.WAYLAND_DISPLAY };
+  }
+
+  const read = (vars, key) => {
+    const hit = vars.find(v => v.startsWith(`${key}=`));
+    return hit ? hit.slice(key.length + 1) : undefined;
+  };
+
+  let fallback = null;
+  for (const vars of scanProcesses()) {
+    const env = {};
+    const display = read(vars, 'DISPLAY');
+    const wayland = read(vars, 'WAYLAND_DISPLAY');
+    if (display) env.DISPLAY = display;
+    if (wayland) env.WAYLAND_DISPLAY = wayland;
+    if (!display && !wayland) continue;
+    // XAUTHORITY travels with DISPLAY: without it the emulator cannot
+    // authenticate to the X server and dies instead of opening a tab.
+    const xauth = display ? read(vars, 'XAUTHORITY') : undefined;
+    if (xauth) env.XAUTHORITY = xauth;
+    // gnome-terminal is a D-Bus client. If DISPLAY was not inherited, the bus
+    // address cannot be assumed to have been either.
+    const bus = read(vars, 'DBUS_SESSION_BUS_ADDRESS');
+    if (bus) env.DBUS_SESSION_BUS_ADDRESS = bus;
+
+    if (wayland || hasLocalDisplaySocket(display)) return env;
+    // A display we cannot confirm as local (forwarded ssh -X, stale Xvfb) is
+    // better than nothing, but only if no local one turns up.
+    fallback ??= env;
+  }
+  return fallback ?? {};
+}
+
 export function buildTerminalCommand(sessionPath, cliArgs, title) {
-  const hasDisplay = Boolean(process.env.DISPLAY || process.env.WAYLAND_DISPLAY);
+  const hasDisplay = Object.keys(resolveDisplayEnv()).length > 0;
   if (!hasDisplay) return [sessionPath, cliArgs];
 
   for (const term of TERMINAL_EMULATORS) {
@@ -411,8 +515,11 @@ export class RemoteSessionManager {
       const [spawnCmd, spawnArgs] = buildTerminalCommand(
         sessionPath, cliArgs, `remote-session ${childSessionId.slice(0, 8)}`,
       );
-      // Join the user's existing terminal window as a tab (see terminalAttachEnv).
-      Object.assign(env, terminalAttachEnv());
+      // Hand the emulator the graphical session it must draw on -- systemd
+      // --user gave pc-agent no DISPLAY of its own (see resolveDisplayEnv) --
+      // then join the user's existing terminal window as a tab (see
+      // terminalAttachEnv).
+      Object.assign(env, resolveDisplayEnv(), terminalAttachEnv());
       const child = pty.spawn(spawnCmd, spawnArgs, {
         name: 'xterm-256color',
         cols: 120,

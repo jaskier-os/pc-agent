@@ -9,7 +9,7 @@ import fs from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
-import { buildSpawnArgs, buildTerminalCommand, hasExistingTranscript, rewriteWsUrl, sanitizeProjectPath, terminalAttachEnv } from '../src/remote-sessions.js';
+import { buildSpawnArgs, buildTerminalCommand, hasExistingTranscript, resolveDisplayEnv, rewriteWsUrl, sanitizeProjectPath, terminalAttachEnv } from '../src/remote-sessions.js';
 import { AttachClient } from '../src/attach-client.js';
 
 let pass = 0;
@@ -22,6 +22,24 @@ async function test(name, fn) {
   } catch (err) {
     console.log(`FAIL  ${name}\n      ${err.message}`);
     fail++;
+  }
+}
+
+// Whether a graphical session exists, decided WITHOUT calling the code under
+// test -- a guard that asks resolveDisplayEnv() would let a stub returning {}
+// skip itself, and the bug would sail through green.
+//
+// XDG_RUNTIME_DIR is captured now: a later test reassigns it while faking HOME.
+const xdgRuntimeDir = process.env.XDG_RUNTIME_DIR;
+function graphicalSessionExists() {
+  try {
+    if (fs.readdirSync('/tmp/.X11-unix').length > 0) return true;
+  } catch { /* no X sockets */ }
+  if (!xdgRuntimeDir) return false;
+  try {
+    return fs.readdirSync(xdgRuntimeDir).some(n => /^wayland-\d+$/.test(n));
+  } catch {
+    return false;
   }
 }
 
@@ -97,6 +115,11 @@ await test('buildTerminalCommand wraps the CLI in a terminal when a display exis
 });
 
 await test('buildTerminalCommand runs the CLI directly when headless', () => {
+  // "Headless" means NO graphical session on the host -- not merely an unset
+  // DISPLAY. pc-agent runs under `systemd --user` and never inherits DISPLAY
+  // even on a desktop, so treating unset-env as headless is precisely the bug
+  // that stopped sessions opening a terminal tab (see resolveDisplayEnv).
+  if (graphicalSessionExists()) return;
   const prevDisplay = process.env.DISPLAY;
   const prevWayland = process.env.WAYLAND_DISPLAY;
   delete process.env.DISPLAY;
@@ -414,6 +437,96 @@ await test('terminalAttachEnv finds a GNOME_TERMINAL_SERVICE when one exists', (
   assert.ok(typeof env === 'object' && env !== null);
   if (env.GNOME_TERMINAL_SERVICE !== undefined) {
     assert.ok(env.GNOME_TERMINAL_SERVICE.length > 0);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// resolveDisplayEnv
+//
+// pc-agent is started by `systemd --user`, which does NOT inherit DISPLAY from
+// the graphical session. buildTerminalCommand read process.env.DISPLAY
+// directly, saw nothing, took its headless fallback, and ran the CLI bare
+// inside pc-agent's own pty: the session worked and the phone attached, but no
+// terminal tab ever appeared on the PC -- the user could not see or type into
+// the session they were supposedly sharing.
+// ---------------------------------------------------------------------------
+// A fake /proc: each entry is one process's environ. Injecting this is what
+// makes the headless and multi-display cases testable on ANY host -- a test
+// that skips itself when the real host disagrees reports PASS while covering
+// nothing.
+function fakeProc(...envs) {
+  return () => envs; // each entry is one process's environ, already split
+}
+
+await test('resolveDisplayEnv recovers DISPLAY when the daemon did not inherit one', () => {
+  const env = resolveDisplayEnv({
+    processEnv: {},
+    scanProcesses: fakeProc(['HOME=/home/u'], ['DISPLAY=:0', 'XAUTHORITY=/run/xauth']),
+  });
+  assert.strictEqual(env.DISPLAY, ':0');
+  assert.strictEqual(env.XAUTHORITY, '/run/xauth');
+});
+
+await test('resolveDisplayEnv prefers an inherited DISPLAY over scanning', () => {
+  const env = resolveDisplayEnv({
+    processEnv: { DISPLAY: ':99' },
+    scanProcesses: fakeProc(['DISPLAY=:0']),
+  });
+  assert.strictEqual(env.DISPLAY, ':99');
+});
+
+await test('resolveDisplayEnv returns nothing on a genuinely headless host', () => {
+  // The direct-exec fallback is CORRECT here; this is the branch the old
+  // "delete process.env.DISPLAY" test could no longer reach on a desktop.
+  const env = resolveDisplayEnv({
+    processEnv: {},
+    scanProcesses: fakeProc(['HOME=/home/u'], ['TERM=xterm']),
+  });
+  assert.deepStrictEqual(env, {});
+});
+
+await test('resolveDisplayEnv skips a forwarded ssh -X display for the local one', () => {
+  // /proc enumeration order is arbitrary, so a same-user `ssh -X` session
+  // (DISPLAY=localhost:10.0) or a stale Xvfb can win the race against the real
+  // seat and the tab opens somewhere the user is not looking -- or not at all.
+  const env = resolveDisplayEnv({
+    processEnv: {},
+    scanProcesses: fakeProc(
+      ['DISPLAY=localhost:10.0', 'XAUTHORITY=/home/u/.Xauthority'],
+      ['DISPLAY=:0', 'XAUTHORITY=/run/xauth'],
+    ),
+    hasLocalDisplaySocket: d => d === ':0',
+  });
+  assert.strictEqual(env.DISPLAY, ':0');
+});
+
+await test('resolveDisplayEnv carries the session bus gnome-terminal needs', () => {
+  const env = resolveDisplayEnv({
+    processEnv: {},
+    scanProcesses: fakeProc([
+      'DISPLAY=:0',
+      'DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus',
+    ]),
+  });
+  assert.strictEqual(env.DBUS_SESSION_BUS_ADDRESS, 'unix:path=/run/user/1000/bus');
+});
+
+await test('buildTerminalCommand still wraps the CLI when DISPLAY was not inherited', () => {
+  const prevDisplay = process.env.DISPLAY;
+  const prevWayland = process.env.WAYLAND_DISPLAY;
+  delete process.env.DISPLAY;
+  delete process.env.WAYLAND_DISPLAY;
+  try {
+    // Only meaningful where an emulator is installed AND a display is
+    // recoverable; otherwise direct exec is the documented correct answer.
+    if (!graphicalSessionExists()) return;
+    const [cmd, args] = buildTerminalCommand('/bin/remote-session', ['--session-id', SID], 'title');
+    assert.notStrictEqual(cmd, '/bin/remote-session', 'must not silently run the CLI bare');
+    assert.ok(args.includes('/bin/remote-session'), 'CLI must be the wrapped command');
+    assert.ok(args.includes('--session-id'), 'CLI args must be preserved');
+  } finally {
+    if (prevDisplay !== undefined) process.env.DISPLAY = prevDisplay;
+    if (prevWayland !== undefined) process.env.WAYLAND_DISPLAY = prevWayland;
   }
 });
 
