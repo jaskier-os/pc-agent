@@ -551,9 +551,19 @@ export class PCAgent extends BaseAgent {
 
     if (action === 'remote_session_export_transcript') {
       try {
-        const { workDir, sessionId } = request;
+        const { workDir, sessionId, limit, before } = request;
         if (!workDir || !sessionId) {
           return { requestId, status: 'error', text: 'Missing workDir or sessionId' };
+        }
+        // With a limit the manager returns a page envelope; forward the cursor
+        // fields alongside the entries so the orchestrator can page.
+        if (limit != null) {
+          const page = await this.remoteSessionManager.exportTranscript(workDir, sessionId, { limit, before });
+          return {
+            requestId,
+            status: 'success',
+            data: { transcript: page.entries, nextCursor: page.nextCursor, hasMore: page.hasMore },
+          };
         }
         const transcript = await this.remoteSessionManager.exportTranscript(workDir, sessionId);
         return { requestId, status: 'success', data: { transcript } };

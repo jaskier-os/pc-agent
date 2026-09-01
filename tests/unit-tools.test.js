@@ -26,7 +26,7 @@ const NO_CLEANUP = process.argv.includes('--no-cleanup');
 
 let passed = 0;
 let failed = 0;
-const total = 43;
+const total = 46;
 
 function setup() {
   if (fs.existsSync(TEST_DIR)) {
@@ -51,6 +51,76 @@ function writeFixture(name, content) {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(p, content, 'utf-8');
   return p;
+}
+
+// ---------------------------------------------------------------------------
+// remote-sessions.js: export-transcript argument forwarding
+//
+// A stub stands in for the CLI binary: it echoes back the argv it was given
+// plus a payload in the shape the real command produces, so these assert the
+// contract between the manager and the CLI without needing a real session.
+// ---------------------------------------------------------------------------
+
+function makeCliStub() {
+  const stubPath = path.join(TEST_DIR, 'fake-session-cli');
+  fs.writeFileSync(stubPath, [
+    '#!/usr/bin/env node',
+    'const argv = process.argv.slice(2);',
+    'const at = f => { const i = argv.indexOf(f); return i >= 0 ? argv[i + 1] : null; };',
+    'const limit = at("--limit");',
+    // Echo argv back inside the payload so the test can assert on it.
+    'const entry = { ts: "2026-01-01T00:00:00.000Z", type: "rc_message", data: { argv }, uid: "u-0" };',
+    'if (limit === null) { process.stdout.write(JSON.stringify([entry]) + "\\n"); }',
+    'else { process.stdout.write(JSON.stringify({ entries: [entry], nextCursor: "cur-1", hasMore: true }) + "\\n"); }',
+  ].join('\n'), 'utf-8');
+  fs.chmodSync(stubPath, 0o755);
+  return stubPath;
+}
+
+async function makeManager() {
+  const mod = await import('../src/remote-sessions.js');
+  const Manager = mod.RemoteSessionManager || mod.default;
+  const mgr = Object.create(Manager.prototype);
+  mgr.sessionBin = makeCliStub();
+  return mgr;
+}
+
+async function testExportTranscriptLegacyShape() {
+  console.log(`[44/${total}] export-transcript without limit stays a bare array...`);
+  const mgr = await makeManager();
+  const result = await mgr.exportTranscript('/tmp/work', 'sess-1');
+  assert(Array.isArray(result), 'unpaged export must remain a bare array');
+  const argv = result[0].data.argv;
+  assert(!argv.includes('--limit'), 'must not pass --limit when none was requested');
+  assert(!argv.includes('--before'), 'must not pass --before when none was requested');
+  assert(argv.includes('--session-id') && argv.includes('sess-1'), 'session id forwarded');
+  passed++;
+  console.log('  OK\n');
+}
+
+async function testExportTranscriptForwardsPaging() {
+  console.log(`[45/${total}] export-transcript forwards limit/before and parses the envelope...`);
+  const mgr = await makeManager();
+  const page = await mgr.exportTranscript('/tmp/work', 'sess-1', { limit: 25, before: 'cur-0' });
+  assert(!Array.isArray(page), 'paged export must return an envelope, not an array');
+  assert.strictEqual(page.nextCursor, 'cur-1', 'nextCursor parsed');
+  assert.strictEqual(page.hasMore, true, 'hasMore parsed');
+  const argv = page.entries[0].data.argv;
+  assert.strictEqual(argv[argv.indexOf('--limit') + 1], '25', 'limit forwarded');
+  assert.strictEqual(argv[argv.indexOf('--before') + 1], 'cur-0', 'before forwarded');
+  passed++;
+  console.log('  OK\n');
+}
+
+async function testExportTranscriptOmitsBeforeOnFirstPage() {
+  console.log(`[46/${total}] export-transcript omits --before for the newest page...`);
+  const mgr = await makeManager();
+  const page = await mgr.exportTranscript('/tmp/work', 'sess-1', { limit: 10 });
+  const argv = page.entries[0].data.argv;
+  assert(argv.includes('--limit'), 'limit forwarded');
+  assert(!argv.includes('--before'), 'no cursor means no --before flag');
+  passed++;
+  console.log('  OK\n');
 }
 
 // ---------------------------------------------------------------------------
@@ -694,6 +764,11 @@ async function run() {
     await testExploreMissingTask();
     await testExploreMissingProjectPath();
     await testExploreMissingCommunicator();
+
+    // remote-sessions.js (export-transcript paging contract)
+    await testExportTranscriptLegacyShape();
+    await testExportTranscriptForwardsPaging();
+    await testExportTranscriptOmitsBeforeOnFirstPage();
 
     console.log(`\nAll ${passed}/${total} tests passed!`);
   } catch (err) {

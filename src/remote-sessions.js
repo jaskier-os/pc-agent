@@ -761,22 +761,31 @@ export class RemoteSessionManager {
     }
   }
 
-  // Reconstruct a session's full transcript from its on-disk JSONL by shelling
-  // out to the remote-session CLI's export-transcript subcommand. Used so the
+  // Reconstruct a session's transcript from its on-disk JSONL by shelling out
+  // to the remote-session CLI's export-transcript subcommand. Used so the
   // orchestrator can serve history for conversations started directly on the PC
-  // (which have no server-side transcript). Returns an array of phone RC
-  // transcript entries ({ ts, type, data }).
-  async exportTranscript(workDir, sessionId) {
+  // (which have no server-side transcript).
+  //
+  // Without opts.limit this returns the whole transcript as a bare array of
+  // phone RC entries ({ ts, type, data, uid }). With opts.limit it returns a
+  // page envelope { entries, nextCursor, hasMore } -- the CLI switches shape on
+  // the same flag, so the two stay in step.
+  async exportTranscript(workDir, sessionId, opts = {}) {
     if (!workDir) throw new Error('Missing workDir');
     if (!sessionId) throw new Error('Missing sessionId');
     const sessionPath = findSessionBinary(this.sessionBin);
     const args = ['export-transcript', '--session-id', sessionId, '--dir', workDir, '--json'];
+    const paged = opts.limit != null;
+    if (paged) {
+      args.push('--limit', String(opts.limit));
+      if (opts.before) args.push('--before', String(opts.before));
+    }
     const { stdout } = await execFileAsync(sessionPath, args, {
       maxBuffer: 256 * 1024 * 1024,
       timeout: 60000,
     });
     const trimmed = stdout.trim();
-    if (!trimmed) return [];
+    if (!trimmed) return paged ? { entries: [], nextCursor: null, hasMore: false } : [];
     try {
       return JSON.parse(trimmed);
     } catch (err) {
