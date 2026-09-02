@@ -110,6 +110,16 @@ export class AttachClient extends EventEmitter {
   }
 
   _onFrame(frame) {
+    // Every inbound frame is logged: a handshake that stalls used to report
+    // only "timed out waiting for attach_ok", which says nothing about how far
+    // the CLI actually got.
+    if (!this._seenTypes) this._seenTypes = new Set();
+    this._seenTypes.add(frame.type);
+    console.log(`[attach-client] <- ${frame.type}${
+      frame.type === 'ws_state' ? ` state=${frame.state} close=${frame.closeCode ?? '-'}` : ''
+    }${frame.reason ? ` reason=${frame.reason}` : ''}${
+      frame.message ? ` message=${String(frame.message).slice(0, 200)}` : ''
+    }`);
     if (frame.type === 'ws_state') {
       this.emit('ws_state', { state: frame.state, closeCode: frame.closeCode });
       if (frame.state === 'closed') {
@@ -135,9 +145,16 @@ export class AttachClient extends EventEmitter {
 
   _wait(type, timeoutMs) {
     return new Promise((resolve, reject) => {
+      const startedAt = Date.now();
       const timer = setTimeout(() => {
         this._waiters.delete(type);
-        reject(new Error(`timed out waiting for ${type}`));
+        // Name what DID arrive, so a stall is diagnosable from the log alone
+        // instead of requiring a bisect of the CLI.
+        const seen = this._seenTypes ? [...this._seenTypes].join(',') : 'none';
+        reject(new Error(
+          `timed out waiting for ${type} after ${Date.now() - startedAt}ms ` +
+          `(frames received meanwhile: ${seen})`,
+        ));
       }, timeoutMs);
       this._waiters.set(type, { resolve, reject, timer });
     });
