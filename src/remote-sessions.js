@@ -7,7 +7,7 @@ import { randomUUID } from 'crypto';
 import { execFile, execFileSync } from 'node:child_process';
 import { promisify } from 'node:util';
 import { AttachClient } from './attach-client.js';
-import { findLiveSession, waitForLiveSession } from './session-registry.js';
+import { findLiveSession, listLiveSessions, waitForLiveSession } from './session-registry.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -725,17 +725,85 @@ export class RemoteSessionManager {
 
   listSessions() {
     const result = [];
+    const seenPids = new Set();
     for (const [pid, session] of this.sessions) {
+      seenPids.add(pid);
       result.push({
         pid,
         workDir: session.workDir,
         sessionId: session.sessionId,
         startedAt: session.startedAt,
         alive: session.alive,
-        attached: session.kind === 'attached'
+        attached: session.kind === 'attached',
+        adoptable: false
+      });
+    }
+    // Also surface interactive CLIs the user started at the terminal that
+    // pc-agent has never spawned or attached to. They live only in the on-disk
+    // registry (~/.claude/sessions/*.json), so the phone would otherwise never
+    // see that a live PC-side session exists for a conversation. They are
+    // reported as adoptable so chat-open can attach to them instead of doing
+    // nothing until the user sends a message.
+    for (const entry of listLiveSessions()) {
+      if (seenPids.has(entry.pid)) continue;
+      if (entry.kind !== 'interactive') continue;
+      if (!entry.sessionId) continue;
+      result.push({
+        pid: entry.pid,
+        workDir: entry.cwd,
+        sessionId: entry.sessionId,
+        startedAt: entry.startedAt || null,
+        alive: true,
+        attached: false,
+        adoptable: true
       });
     }
     return result;
+  }
+
+  /**
+   * Adopt-only counterpart to startSession: attach to a live interactive CLI
+   * for this conversation if one exists, and otherwise do NOTHING. Never
+   * spawns. This is what chat-open reconciliation calls -- opening an old chat
+   * must not start a terminal, it must only rejoin a session the user already
+   * has open.
+   *
+   * Returns { adopted: true, ...session } on success, { adopted: false } when
+   * there is no live attachable CLI (not an error).
+   */
+  async adoptSession(workDir, sessionId, wsUrl, apiKey, permissionMode) {
+    if (!sessionId || !workDir) return { adopted: false };
+
+    // Already driving this session -- report the existing desktop.
+    for (const [pid, s] of this.sessions) {
+      if (s.sessionId === sessionId && s.alive) {
+        return { adopted: true, pid, sessionId: s.sessionId, workDir: s.workDir, startedAt: s.startedAt, attached: s.kind === 'attached' };
+      }
+    }
+
+    const live = findLiveSession(sessionId, workDir);
+    if (!live) return { adopted: false };
+
+    try {
+      const attached = await this._attachToLiveSession(live, {
+        sessionId,
+        workDir,
+        wsUrl: rewriteWsUrl(wsUrl, this.orchestratorUrl) ?? wsUrl,
+        apiKey,
+        permissionMode,
+      });
+      return { adopted: true, ...attached };
+    } catch (err) {
+      // already_attached is the desired end state: a control peer is already
+      // this session's desktop. Report success instead of spawning a rival.
+      if (err.code === 'already_attached') {
+        return { adopted: true, pid: live.pid, sessionId, workDir, startedAt: new Date().toISOString(), attached: true };
+      }
+      // Every other failure (consent_denied, transient) is non-fatal for
+      // adopt: unlike startSession we do NOT fall back to spawn.
+      console.log(`[remote-sessions] Adopt of pid=${live.pid} failed (${err.message}); not spawning`);
+      return { adopted: false };
+    }
   }
 
   // Enumerate resumable conversations on disk for a directory by shelling out

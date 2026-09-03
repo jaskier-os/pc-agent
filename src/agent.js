@@ -512,6 +512,26 @@ export class PCAgent extends BaseAgent {
       }
     }
 
+    if (action === 'remote_session_adopt') {
+      try {
+        const { workDir, sessionId, wsUrl, apiKey, permissionMode } = request;
+        if (!workDir) {
+          return { requestId, status: 'error', text: 'Missing workDir' };
+        }
+        if (!sessionId || !wsUrl || !apiKey) {
+          return { requestId, status: 'error', text: 'Missing sessionId, wsUrl, or apiKey' };
+        }
+        const CLI_MODES = ['default', 'acceptEdits', 'bypassPermissions', 'plan'];
+        if (!permissionMode || !CLI_MODES.includes(permissionMode)) {
+          return { requestId, status: 'error', text: 'invalid_permission_mode' };
+        }
+        const res = await this.remoteSessionManager.adoptSession(workDir, sessionId, wsUrl, apiKey, permissionMode);
+        return { requestId, status: 'success', data: res };
+      } catch (err) {
+        return { requestId, status: 'error', text: err.message };
+      }
+    }
+
     if (action === 'set_permission_mode') {
       const CLI_MODES = ['default', 'acceptEdits', 'bypassPermissions', 'plan'];
       const { sessionId, mode } = request;
