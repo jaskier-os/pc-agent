@@ -514,10 +514,11 @@ export class PCAgent extends BaseAgent {
 
     if (action === 'remote_session_adopt') {
       try {
+        // workDir is intentionally optional here, unlike remote_session_start:
+        // a terminal-started session has no orchestrator-side workDir, so
+        // adoptSession resolves the CLI's real cwd from the live-session
+        // registry by sessionId when it is absent.
         const { workDir, sessionId, wsUrl, apiKey, permissionMode } = request;
-        if (!workDir) {
-          return { requestId, status: 'error', text: 'Missing workDir' };
-        }
         if (!sessionId || !wsUrl || !apiKey) {
           return { requestId, status: 'error', text: 'Missing sessionId, wsUrl, or apiKey' };
         }

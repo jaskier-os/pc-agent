@@ -115,6 +115,26 @@ test('adoptSession returns adopted:false and does not spawn when nothing is live
   }
 });
 
+// The orchestrator has no workDir for a terminal-started session, so adopt must
+// resolve the CLI's cwd from the registry by sessionId. With no matching entry
+// it returns adopted:false and never spawns.
+test('adoptSession with null workDir resolves from registry and never spawns', async () => {
+  // No registry entry for this session -> cannot resolve a cwd -> adopted:false.
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'adopt-null-'));
+  fs.mkdirSync(path.join(home, '.claude', 'sessions'), { recursive: true });
+  const savedHome = process.env.HOME;
+  process.env.HOME = home;
+  try {
+    const mgr = new RemoteSessionManager([], null, '');
+    mgr._startSessionInner = () => { throw new Error('adopt must not spawn'); };
+    const res = await mgr.adoptSession(null, SID, 'wss://x/ws', 'key', 'bypassPermissions');
+    assert.deepStrictEqual(res, { adopted: false });
+  } finally {
+    process.env.HOME = savedHome;
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
 // A session pc-agent already drives is reported adopted without any attach dial.
 test('adoptSession reports an already-owned live session as adopted', async () => {
   const mgr = new RemoteSessionManager([], null, '');

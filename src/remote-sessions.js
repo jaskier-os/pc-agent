@@ -772,7 +772,7 @@ export class RemoteSessionManager {
    * there is no live attachable CLI (not an error).
    */
   async adoptSession(workDir, sessionId, wsUrl, apiKey, permissionMode) {
-    if (!sessionId || !workDir) return { adopted: false };
+    if (!sessionId) return { adopted: false };
 
     // Already driving this session -- report the existing desktop.
     for (const [pid, s] of this.sessions) {
@@ -781,8 +781,21 @@ export class RemoteSessionManager {
       }
     }
 
-    const live = findLiveSession(sessionId, workDir);
+    // The orchestrator has no workDir for a terminal-started session (it never
+    // saw it). Resolve the CLI's real cwd from its own registry entry so
+    // findLiveSession's mandatory cwd === workDir check can pass.
+    let effectiveWorkDir = workDir;
+    if (!effectiveWorkDir) {
+      const entry = listLiveSessions().find(
+        e => e.sessionId === sessionId && e.kind === 'interactive' && e.cwd
+      );
+      if (!entry) return { adopted: false };
+      effectiveWorkDir = entry.cwd;
+    }
+
+    const live = findLiveSession(sessionId, effectiveWorkDir);
     if (!live) return { adopted: false };
+    workDir = effectiveWorkDir;
 
     try {
       const attached = await this._attachToLiveSession(live, {
