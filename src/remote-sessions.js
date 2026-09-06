@@ -328,6 +328,21 @@ const TERMINAL_EMULATORS = [
   { bin: 'xterm', args: title => ['-title', title, '-e'] },
 ];
 
+/**
+ * True when gnome-terminal refused a `--tab` attach because the borrowed
+ * GNOME_TERMINAL_SCREEN names a tab the server no longer has.
+ *
+ * terminalAttachEnv lifts SERVICE/SCREEN from an arbitrary process environ so
+ * the tab joins the user's window. A process outlives the window it was started
+ * in (a backgrounded job, a nohup'd script), so the borrowed screen can be
+ * stale. gnome-terminal then prints this line and EXITS 0 without running the
+ * command: the CLI never starts, and pc-agent sees a clean exit and reports
+ * "exited with code 0 before session was ready".
+ */
+export function isTabAttachRejected(ptyOutput) {
+  return /Failed to get screen from object path/.test(ptyOutput);
+}
+
 function findOnPath(bin) {
   for (const dir of (process.env.PATH || '').split(path.delimiter)) {
     if (!dir) continue;
@@ -469,7 +484,10 @@ export class RemoteSessionManager {
       }
     }
 
-    return new Promise((resolve, reject) => {
+    // attachToTab: first try joins the user's existing terminal window. If
+    // gnome-terminal rejects the borrowed screen (see isTabAttachRejected) the
+    // spawn is retried once with attachToTab=false, which opens a fresh window.
+    const spawnOnce = (attachToTab) => new Promise((resolve, reject) => {
       let resolved = false;
 
       // Strip Claude Code env vars to prevent nested session detection
@@ -518,8 +536,9 @@ export class RemoteSessionManager {
       // Hand the emulator the graphical session it must draw on -- systemd
       // --user gave pc-agent no DISPLAY of its own (see resolveDisplayEnv) --
       // then join the user's existing terminal window as a tab (see
-      // terminalAttachEnv).
-      Object.assign(env, resolveDisplayEnv(), terminalAttachEnv());
+      // terminalAttachEnv). On the retry after a rejected attach the SCREEN
+      // vars are deliberately left out so the emulator opens its own window.
+      Object.assign(env, resolveDisplayEnv(), attachToTab ? terminalAttachEnv() : {});
       const child = pty.spawn(spawnCmd, spawnArgs, {
         name: 'xterm-256color',
         cols: 120,
@@ -550,7 +569,17 @@ export class RemoteSessionManager {
       const THROUGHPUT_LIMIT_BYTES_PER_SEC = 5_000_000;
       const SINGLE_CHUNK_LIMIT_BYTES = 1_000_000;
 
+      // The emulator's startup output, kept only until the session becomes
+      // ready. gnome-terminal reports a rejected --tab attach here, then exits
+      // 0 without running the CLI; the exit handler needs this text to tell that
+      // apart from a CLI that started and quit.
+      let earlyOutput = '';
+      const EARLY_OUTPUT_CAP = 8192;
+
       child.onData((data) => {
+        if (!resolved && earlyOutput.length < EARLY_OUTPUT_CAP) {
+          earlyOutput += data.toString();
+        }
         const session = this.sessions.get(pid);
         if (!session || session.throttleKilled) return;
 
@@ -596,14 +625,22 @@ export class RemoteSessionManager {
       // The pid we attach to is the CLI's, not the terminal wrapper's, so it is
       // resolved from the session registry by sessionId rather than assumed.
       waitForLiveSession(childSessionId, workDir, ATTACH_AFTER_SPAWN_TIMEOUT_MS)
-        .then(live => this._attachToLiveSession(live, {
-          sessionId: childSessionId,
-          workDir,
-          wsUrl,
-          apiKey,
-          permissionMode,
-        }))
+        .then(live => {
+          // If this attempt already settled -- the terminal rejected its --tab
+          // attach and the retry took over -- the live CLI this poller found
+          // belongs to the RETRY (same childSessionId). Attaching here would
+          // attach that CLI a second time. Let the retry's own poller do it.
+          if (resolved) return null;
+          return this._attachToLiveSession(live, {
+            sessionId: childSessionId,
+            workDir,
+            wsUrl,
+            apiKey,
+            permissionMode,
+          });
+        })
         .then(attached => {
+          if (resolved || attached === null) return;
           resolved = true;
           resolve(attached);
         })
@@ -625,6 +662,18 @@ export class RemoteSessionManager {
         clearTimeout(timeout);
         clearTimeout(logCutoff);
         console.log(`[remote-sessions] Process exited: pid=${pid}, code=${exitCode}`);
+        // A rejected --tab attach exits 0 with the CLI never having run. That is
+        // a stale borrowed screen, not a CLI failure: retry once in a fresh
+        // window rather than reporting the session dead. This attempt's entry
+        // is dropped outright -- it was never a session, so there is nothing
+        // worth keeping for history.
+        if (!resolved && attachToTab && isTabAttachRejected(earlyOutput)) {
+          resolved = true;
+          console.log(`[remote-sessions] Terminal rejected --tab attach (stale GNOME_TERMINAL_SCREEN); retrying in a new window`);
+          this.sessions.delete(pid);
+          resolve(spawnOnce(false));
+          return;
+        }
         const session = this.sessions.get(pid);
         if (session) {
           session.alive = false;
@@ -638,6 +687,8 @@ export class RemoteSessionManager {
         }
       });
     });
+
+    return spawnOnce(true);
   }
 
   /**

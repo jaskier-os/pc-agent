@@ -9,7 +9,7 @@ import fs from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
-import { buildSpawnArgs, buildTerminalCommand, hasExistingTranscript, resolveDisplayEnv, rewriteWsUrl, sanitizeProjectPath, terminalAttachEnv } from '../src/remote-sessions.js';
+import { buildSpawnArgs, buildTerminalCommand, hasExistingTranscript, isTabAttachRejected, resolveDisplayEnv, rewriteWsUrl, sanitizeProjectPath, terminalAttachEnv } from '../src/remote-sessions.js';
 import { AttachClient } from '../src/attach-client.js';
 
 let pass = 0;
@@ -438,6 +438,31 @@ await test('terminalAttachEnv finds a GNOME_TERMINAL_SERVICE when one exists', (
   if (env.GNOME_TERMINAL_SERVICE !== undefined) {
     assert.ok(env.GNOME_TERMINAL_SERVICE.length > 0);
   }
+});
+
+// ---------------------------------------------------------------------------
+// isTabAttachRejected
+//
+// terminalAttachEnv borrows GNOME_TERMINAL_SERVICE/SCREEN from an arbitrary
+// /proc environ so `--tab` lands in the user's window. A process outlives the
+// window it was started in (a backgrounded job, a nohup'd script), so the
+// borrowed screen can name a tab the server no longer has. gnome-terminal then
+// prints "Failed to get screen from object path" and EXITS 0 without ever
+// running the command: the CLI never starts, pc-agent sees a clean exit and
+// reports "exited with code 0 before session was ready". Seen 5 times in the
+// log. The spawn must recognise that output and retry in a fresh window.
+// ---------------------------------------------------------------------------
+await test('isTabAttachRejected recognises the stale-screen failure', () => {
+  assert.strictEqual(
+    isTabAttachRejected('# Error creating terminal: Failed to get screen from object path /org/gnome/Terminal/screen/deadbeef\n'),
+    true,
+  );
+  // Theme warnings alone are noise, not a rejection.
+  assert.strictEqual(
+    isTabAttachRejected("# Theme parsing error: gtk.css:9:20: '-gtk-icon-filter' is not a valid property name\n"),
+    false,
+  );
+  assert.strictEqual(isTabAttachRejected(''), false);
 });
 
 // ---------------------------------------------------------------------------
